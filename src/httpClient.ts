@@ -1,5 +1,3 @@
-import type { Dispatcher } from "undici";
-import { fetch, Agent } from "undici";
 import { version } from "../package.json";
 import { gunzip, gzip } from "node:zlib";
 import { promisify } from "node:util";
@@ -35,20 +33,17 @@ export interface HTTPClient {
 }
 
 /**
- * This a helper function that returns a class for making fetch requests
- * against the API.
+ * Returns a class for making fetch requests against the API.
  *
  * @param baseUrl The base URL of the API endpoint.
  * @param apiKey The API key to use for authentication.
- *
- * @returns An HTTPClient to make requests against the API.
  */
 export const createHTTPClient = (
   baseUrl: string,
   apiKey: string,
   connectTimeout: number,
-  idleTimeout: number,
-  warmConnections: number,
+  idleTimeout: number, // no longer used with fetch
+  warmConnections: number, // will just do HEAD requests
   compression: boolean,
 ) =>
   new DefaultHTTPClient(
@@ -61,7 +56,7 @@ export const createHTTPClient = (
   );
 
 class DefaultHTTPClient implements HTTPClient {
-  private agent: Agent;
+  private connectTimeout: number;
   private baseUrl: string;
   private origin: URL;
   private apiKey: string;
@@ -81,21 +76,18 @@ class DefaultHTTPClient implements HTTPClient {
     this.origin.pathname = "";
     this.apiKey = apiKey;
     this.compression = compression;
+    this.connectTimeout = connectTimeout;
 
-    this.agent = new Agent({
-      keepAliveTimeout: idleTimeout, // how long a socket can be idle for before it is closed
-      keepAliveMaxTimeout: 24 * 60 * 60 * 1000, // maximum configurable timeout with server hint
-      connect: {
-        timeout: connectTimeout,
-      },
-    });
-
+    // "Warm up" connections by doing HEAD requests.
+    // In environments like Cloudflare Workers, this doesn't necessarily
+    // do the same "connection pooling" you'd get in Node.js with an agent,
+    // but we replicate the logic for consistency.
     for (let i = 0; i < warmConnections; i++) {
-      // send a small request to put some connections in the pool
       void fetch(this.baseUrl, {
         method: "HEAD",
         headers: { "User-Agent": this.userAgent },
-        dispatcher: this.agent,
+      }).catch(() => {
+        // Non-critical error if warm-up fails; ignore or log.
       });
     }
   }
@@ -110,16 +102,12 @@ class DefaultHTTPClient implements HTTPClient {
   }: RequestParams): RequestResponse<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (query) {
-      Object.keys(query).forEach((key) => {
+      for (const key in query) {
         const value = query[key];
         if (value) {
           url.searchParams.append(key, value);
         }
-      });
-    }
-    path = url.pathname;
-    if (query) {
-      path += "?" + url.search;
+      }
     }
 
     const headers: Record<string, string> = {
@@ -137,7 +125,7 @@ class DefaultHTTPClient implements HTTPClient {
       headers["Content-Type"] = "application/json";
     }
 
-    let requestCompressionDuration;
+    let requestCompressionDuration: number | undefined;
     let requestBody: Uint8Array | string | null = null;
     if (body && compress && this.compression) {
       headers["Content-Encoding"] = "gzip";
@@ -149,7 +137,7 @@ class DefaultHTTPClient implements HTTPClient {
     }
 
     const maxAttempts = retryable ? 3 : 1;
-    let response!: Dispatcher.ResponseData;
+    let response!: Response;
     let error: TurbopufferError | null = null;
     let request_start!: number;
     let response_start!: number;
@@ -157,94 +145,133 @@ class DefaultHTTPClient implements HTTPClient {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       error = null;
       request_start = performance.now();
+      // Use an AbortController to implement connectTimeout
+      const controller = new AbortController();
+      const { signal } = controller;
+      const timeoutHandle = setTimeout(() => {
+        controller.abort();
+      }, this.connectTimeout);
       try {
-        response = await this.agent.request({
-          origin: this.origin,
-          path,
-          method: method as Dispatcher.HttpMethod,
+        response = await fetch(url.toString(), {
+          method,
+          signal, // attach the abort signal
           headers,
           body: requestBody,
         });
       } catch (e: unknown) {
         if (e instanceof Error) {
-          if (e.cause instanceof Error) {
-            // wrap generic undici "fetch failed" error with the underlying cause
-            error = new TurbopufferError(`fetch failed: ${e.cause.message}`, {
-              cause: e,
-            });
+          // Check if it was an abort error vs. another fetch error
+          if (e.name === "AbortError") {
+            error = new TurbopufferError(
+              `fetch aborted (connectTimeout=${this.connectTimeout}ms)`,
+              { cause: e },
+            );
           } else {
-            // wrap other errors directly
             error = new TurbopufferError(`fetch failed: ${e.message}`, {
               cause: e,
             });
           }
         } else {
-          // not an Error? shouldn't happen but good to be thorough
+          // not an Error? Rare, but handle gracefully
           throw e;
         }
+      } finally {
+        clearTimeout(timeoutHandle);
       }
+
       response_start = performance.now();
 
-      if (!error && response.statusCode >= 400) {
-        let message: string | undefined = undefined;
-        const { body_text } = await consumeResponseText(response);
-        if (response.headers["content-type"] === "application/json") {
-          try {
-            const body = JSON.parse(body_text);
-            if (body && body.status === "error") {
-              message = body.error;
-            } else {
+      if (!error && response) {
+        if (response.status >= 400) {
+          let message: string | undefined;
+          const body_text = await response.text();
+
+          // Attempt JSON parse for a more descriptive error
+          if (response.headers.get("content-type") === "application/json") {
+            try {
+              const parsedBody = JSON.parse(body_text) as {
+                status?: string;
+                error?: string;
+              };
+              if (parsedBody && parsedBody.status === "error") {
+                message = parsedBody.error;
+              } else {
+                message = body_text;
+              }
+            } catch {
               message = body_text;
             }
-          } catch (_: unknown) {
-            /* empty */
+          } else {
+            message = body_text;
           }
-        } else {
-          message = body_text;
+
+          error = new TurbopufferError(
+            message ?? `http error ${response.status}`,
+            {
+              status: response.status,
+            },
+          );
         }
-        error = new TurbopufferError(
-          message ?? `http error ${response.statusCode}`,
-          {
-            status: response.statusCode,
-          },
-        );
       }
+
+      // Retry on 5xx or no status
       if (
         error &&
         statusCodeShouldRetry(error.status) &&
-        attempt + 1 != maxAttempts
+        attempt + 1 !== maxAttempts
       ) {
         await delay(150 * (attempt + 1)); // 150ms, 300ms, 450ms
         continue;
       }
       break;
     }
+
     if (error) {
       throw error;
     }
 
-    if (method === "HEAD" || !response.body) {
+    // If HEAD or no response, return early
+    if (!response || method === "HEAD") {
       return {
-        headers: convertHeadersType(response.headers),
+        headers: convertHeadersType(
+          response ? Object.fromEntries(response.headers) : {},
+        ),
         request_timing: make_request_timing(request_start, response_start),
       };
     }
 
-    const { body_text, body_read_end, decompress_end } =
-      await consumeResponseText(response);
+    // For non-HEAD requests, we read the body:
+    const body_read_end: number = performance.now();
+    let body_text: string;
+    let decompress_end = body_read_end;
 
-    const json = JSON.parse(body_text);
+    // If server returns gzip content, handle decompression
+    // Some fetch implementations might do this automatically,
+    // but we replicate the original logic.
+    if (response.headers.get("content-encoding") === "gzip") {
+      const body_buffer = new Uint8Array(await response.arrayBuffer());
+      const gunzip_buffer = await gunzipAsync(body_buffer);
+      body_text = gunzip_buffer.toString();
+      decompress_end = performance.now();
+    } else {
+      body_text = await response.text();
+    }
+
+    const json = JSON.parse(body_text) as {
+      status?: string;
+      error?: string;
+    };
     const deserialize_end = performance.now();
 
     if (json.status && json.status === "error") {
       throw new TurbopufferError(json.error || (json as string), {
-        status: response.statusCode,
+        status: response.status,
       });
     }
 
     return {
       body: json as T,
-      headers: convertHeadersType(response.headers),
+      headers: convertHeadersType(Object.fromEntries(response.headers)),
       request_timing: make_request_timing(
         request_start,
         response_start,
@@ -264,7 +291,7 @@ export class TurbopufferError extends Error {
     public error: string,
     { status, cause }: { status?: number; cause?: Error },
   ) {
-    super(error, { cause: cause });
+    super(error, { cause });
     this.status = status;
   }
 }
@@ -290,7 +317,7 @@ function make_request_timing(
   return {
     response_time: response_start - request_start,
     body_read_time: body_read_end ? body_read_end - response_start : 0,
-    compress_time: requestCompressionDuration ? requestCompressionDuration : 0,
+    compress_time: requestCompressionDuration ?? 0,
     decompress_time:
       decompress_end && body_read_end ? decompress_end - body_read_end : 0,
     deserialize_time:
@@ -299,35 +326,9 @@ function make_request_timing(
 }
 
 function convertHeadersType(
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string>,
 ): Record<string, string> {
-  for (const key in headers) {
-    const v = headers[key];
-    if (v === undefined) {
-      delete headers[key];
-    } else if (Array.isArray(v)) {
-      headers[key] = v[0];
-    }
-  }
-  return headers as Record<string, string>;
-}
-
-async function consumeResponseText(response: Dispatcher.ResponseData): Promise<{
-  body_text: string;
-  body_read_end: number;
-  decompress_end: number;
-}> {
-  if (response.headers["content-encoding"] == "gzip") {
-    const body_buffer = await response.body.arrayBuffer();
-    const body_read_end = performance.now();
-
-    const gunzip_buffer = await gunzipAsync(body_buffer);
-    const body_text = gunzip_buffer.toString(); // is there a better way?
-    const decompress_end = performance.now();
-    return { body_text, body_read_end, decompress_end };
-  } else {
-    const body_text = await response.body.text();
-    const body_read_end = performance.now();
-    return { body_text, body_read_end, decompress_end: body_read_end };
-  }
+  // For Cloudflare Workers / standard fetch: it's already simplified key/value pairs
+  // We just ensure it's typed as a plain record.
+  return headers;
 }
