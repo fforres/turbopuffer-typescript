@@ -242,20 +242,8 @@ class DefaultHTTPClient implements HTTPClient {
 
     // For non-HEAD requests, we read the body:
     const body_read_end: number = performance.now();
-    let body_text: string;
-    let decompress_end = body_read_end;
-
-    // If server returns gzip content, handle decompression
-    // Some fetch implementations might do this automatically,
-    // but we replicate the original logic.
-    if (response.headers.get("content-encoding") === "gzip") {
-      const body_buffer = new Uint8Array(await response.arrayBuffer());
-      const gunzip_buffer = await gunzipAsync(body_buffer);
-      body_text = gunzip_buffer.toString();
-      decompress_end = performance.now();
-    } else {
-      body_text = await response.text();
-    }
+    const body_text = await response.text();
+    const decompress_end = performance.now();
 
     const json = JSON.parse(body_text) as {
       status?: string;
