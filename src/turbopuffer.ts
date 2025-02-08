@@ -23,13 +23,24 @@ export type AttributeType =
   | number[]
   | boolean;
 export type Attributes = Record<string, AttributeType>;
+export interface FTSParams {
+  k1: number;
+  b: number;
+  language: string;
+  stemming: boolean;
+  remove_stopwords: boolean;
+  case_sensitive: boolean;
+  tokenizer: string;
+}
+// TODO: index signature is a better fit here imo.
+// also look into eslint config to allow for usage of index signatures
 export type Schema = Record<
   string,
   {
     type?: string;
     filterable?: boolean;
-    bm25?: boolean | Record<string, string | boolean>;
-    full_text_search?: boolean | Record<string, string | boolean>;
+    bm25?: boolean | Partial<FTSParams>;
+    full_text_search?: boolean | Partial<FTSParams>;
   }
 >;
 export type RankBySingleField = [string, "BM25", string];
@@ -38,6 +49,9 @@ export type RankBy =
   | RankBySingleField
   | ["Sum", RankBySingleField[]]
   | OrderByAttribute;
+export interface Consistency {
+  level: "strong" | "eventual"
+}
 
 export interface Vector {
   id: Id;
@@ -260,6 +274,7 @@ export class Namespace {
     include_attributes?: boolean | string[];
     filters?: Filters;
     rank_by?: RankBy;
+    consistency?: Consistency;
   }): Promise<QueryResults> {
     const resultsWithMetrics = await this.queryWithMetrics(params);
     return resultsWithMetrics.results;
@@ -279,6 +294,7 @@ export class Namespace {
     include_attributes?: boolean | string[];
     filters?: Filters;
     rank_by?: RankBy;
+    consistency?: Consistency;
   }): Promise<{
     results: QueryResults;
     metrics: QueryMetrics;
@@ -405,6 +421,18 @@ export class Namespace {
         retryable: true,
       })
     ).body!;
+  }
+
+  /**
+   * Returns the current schema for the namespace.
+   * See: https://turbopuffer.com/docs/schema
+   */
+  async schema(): Promise<Schema> {
+    return (await this.client.http.doRequest<Schema>({
+      method: "GET",
+      path: `/v1/namespaces/${this.id}/schema`,
+      retryable: true,
+    })).body!;
   }
 }
 
